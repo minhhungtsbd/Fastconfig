@@ -8,8 +8,8 @@ rem ========================================
 rem Base settings
 pushd "%~dp0"
 set "BASE_DIR=%CD%"
-set "APP_NAME=FastConfigVPS_PyQt5_v3.1"
-set "MAIN_PY=fast_config_vps_qt5.py"
+set "APP_NAME=FastConfigVPS_v3.1"
+set "MAIN_PY=FastConfigVPS.py"
 set "ICON_PNG=app_icon.png"
 set "ICON_ICO=app_icon.ico"
 
