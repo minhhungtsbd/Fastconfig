@@ -14,7 +14,13 @@ import winreg
 import urllib.request
 import tempfile
 import re
-from datetime import datetime
+import warnings
+import ssl
+import platform
+from datetime import datetime, timedelta
+
+# Suppress deprecation warnings from PyQt5
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,7 +28,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QTabWidget, QTextEdit, QProgressBar, QMessageBox,
     QComboBox, QFileDialog, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMetaObject, Q_ARG
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QMetaObject, Q_ARG, pyqtSlot
 from PyQt5.QtGui import QIcon, QColor, QFont, QTextCursor
 
 
@@ -48,12 +54,29 @@ class DownloadThread(QThread):
                     percent = int((downloaded / total_size) * 100)
                     self.progress.emit(percent)
             
+            # Create SSL context that bypasses certificate verification for problematic URLs
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Use SSL context for HTTPS requests
+            if self.url.startswith('https://'):
+                urllib.request.install_opener(urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ssl_context)
+                ))
+            
             urllib.request.urlretrieve(self.url, self.filepath, report_progress)
             
             if os.path.exists(self.filepath):
                 size = os.path.getsize(self.filepath)
                 self.log_signal.emit(f"✓ Tải {self.software_name} thành công ({size} bytes)")
-                self.finished.emit(True, self.filepath)
+                
+                # Kiểm tra và đổi tên file nếu là MSI nhưng có tên .exe (đặc biệt với Chrome)
+                if self.software_name == "Chrome":
+                    actual_filepath = self._check_and_rename_msi(self.filepath)
+                    self.finished.emit(True, actual_filepath)
+                else:
+                    self.finished.emit(True, self.filepath)
             else:
                 self.log_signal.emit(f"✗ Không thể tải {self.software_name}")
                 self.finished.emit(False, "")
@@ -61,6 +84,42 @@ class DownloadThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"✗ Lỗi khi tải {self.software_name}: {str(e)}")
             self.finished.emit(False, "")
+    
+    def _check_and_rename_msi(self, filepath):
+        """Kiểm tra file header và đổi tên nếu là MSI"""
+        try:
+            with open(filepath, 'rb') as f:
+                header = f.read(8)
+            
+            # MSI file signature: D0 CF 11 E0 A1 B1 1A E1
+            if header[:8] == b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1':
+                self.log_signal.emit("🔍 Phát hiện file MSI (header: D0CF11E0)")
+                
+                # Đổi tên từ .exe sang .msi
+                if filepath.endswith('.exe'):
+                    new_filepath = filepath[:-4] + '.msi'
+                    
+                    # Retry logic để xử lý file lock
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            if os.path.exists(new_filepath):
+                                os.remove(new_filepath)
+                            os.rename(filepath, new_filepath)
+                            self.log_signal.emit(f"✓ Đã đổi tên file thành {os.path.basename(new_filepath)}")
+                            return new_filepath
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                time.sleep(0.5)  # Đợi một chút trước khi thử lại
+                            else:
+                                self.log_signal.emit(f"⚠️ Không thể đổi tên file: {str(e)}")
+                                return filepath
+            
+            return filepath
+        
+        except Exception as e:
+            self.log_signal.emit(f"⚠️ Lỗi khi kiểm tra file header: {str(e)}")
+            return filepath
 
 
 class InstallThread(QThread):
@@ -78,10 +137,26 @@ class InstallThread(QThread):
         try:
             self.log_signal.emit(f"Đang cài đặt {self.software_name}...")
             
-            # Xác định tham số cài đặt dựa trên loại file
+            # Lấy phiên bản Windows
+            win_version = platform.version()
+            self.log_signal.emit(f"💻 Windows version: {win_version}")
+            
+            # Kiểm tra loại file
+            is_msi = self.filepath.lower().endswith('.msi')
+            
+            # Logic đặc biệt cho Chrome
             if self.software_name == "Chrome":
-                params = "/silent /install" if self.silent else ""
-            elif self.software_name == "Firefox":
+                success = self._install_chrome(is_msi)
+                if success:
+                    self.log_signal.emit(f"✓ Cài đặt {self.software_name} thành công")
+                    self.finished.emit(True, self.software_name)
+                else:
+                    self.log_signal.emit(f"✗ Cài đặt {self.software_name} thất bại với tất cả methods")
+                    self.finished.emit(False, self.software_name)
+                return
+            
+            # Logic cho các phần mềm khác
+            if self.software_name == "Firefox":
                 params = "-ms" if self.silent else ""
             elif self.software_name == "Edge":
                 params = "/silent /install" if self.silent else ""
@@ -90,6 +165,7 @@ class InstallThread(QThread):
             
             # Chạy installer
             cmd = f'"{self.filepath}" {params}'
+            self.log_signal.emit(f"🔧 Chạy: {cmd}")
             result = subprocess.run(cmd, shell=True, capture_output=True, timeout=300)
             
             if result.returncode == 0:
@@ -105,6 +181,69 @@ class InstallThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"✗ Lỗi khi cài đặt {self.software_name}: {str(e)}")
             self.finished.emit(False, self.software_name)
+    
+    def _install_chrome(self, is_msi):
+        """Cài đặt Chrome với các phương pháp đã test thành công"""
+        if is_msi:
+            # Phương pháp MSI - thử /qn trước, sau đó /passive
+            methods = [
+                ('msiexec /qn', f'msiexec /i "{self.filepath}" /qn /norestart'),
+                ('msiexec /passive', f'msiexec /i "{self.filepath}" /passive /norestart')
+            ]
+        else:
+            # Phương pháp EXE - thử /silent /install trước, sau đó interactive
+            methods = [
+                ('AutoIt (/silent /install)', f'"{self.filepath}" /silent /install'),
+                ('Interactive (no params)', f'"{self.filepath}"')
+            ]
+        
+        for method_name, cmd in methods:
+            try:
+                self.log_signal.emit(f"🔧 Thử phương pháp: {method_name}")
+                self.log_signal.emit(f"   Lệnh: {cmd}")
+                
+                result = subprocess.run(
+                    cmd, 
+                    shell=True, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=300
+                )
+                
+                self.log_signal.emit(f"   Exit code: {result.returncode}")
+                
+                # Kiểm tra Chrome có thực sự được cài hay không
+                chrome_paths = [
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+                ]
+                
+                chrome_found = any(os.path.exists(path) for path in chrome_paths)
+                
+                # Điều kiện thành công: exit code = 0 VÀ Chrome được cài
+                if result.returncode == 0:
+                    if chrome_found:
+                        self.log_signal.emit(f"✓ {method_name} thành công - Chrome đã được cài đặt")
+                        return True
+                    else:
+                        self.log_signal.emit(f"⚠️ Exit code 0 nhưng Chrome không được cài - thử phương pháp tiếp theo")
+                else:
+                    self.log_signal.emit(f"✗ Phương pháp {method_name} thất bại (exit code: {result.returncode})")
+                    if result.stderr:
+                        error_msg = result.stderr.strip()
+                        if error_msg:
+                            self.log_signal.emit(f"   Error: {error_msg[:200]}")
+                    
+            except subprocess.TimeoutExpired:
+                self.log_signal.emit(f"⚠️ Timeout - Phương pháp {method_name} chạy quá lâu")
+                continue
+            except Exception as e:
+                self.log_signal.emit(f"✗ Lỗi với phương pháp {method_name}: {str(e)}")
+                continue
+        
+        # Nếu tất cả phương pháp đều thất bại
+        self.log_signal.emit("✗ Tất cả các phương pháp cài đặt Chrome đều thất bại")
+        return False
 
 
 class FastConfigVPS(QMainWindow):
@@ -112,12 +251,19 @@ class FastConfigVPS(QMainWindow):
     
     VERSION = "3.1"
     
+    # Custom signals for thread-safe UI updates
+    log_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    stop_processing_signal = pyqtSignal()
+    enable_button_signal = pyqtSignal(bool)
+    
     # URLs cho các phần mềm
     SOFTWARE_URLS = {
         "Chrome": {
-            "6.3": "https://archive.org/download/browser_02.05.2022/Browser/ChromeSetup.exe",
+            "6.3": "https://files.cloudmini.net/ChromeSetup.exe",  # Prioritize working fallback URL
             "10.0": "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi",
-            "fallback": "https://files.cloudmini.net/ChromeSetup.exe",
+            "fallback": "https://archive.org/download/browser_02.05.2022/Browser/ChromeSetup.exe",  # Move problematic URL to fallback
             "filename": "chrome_installer.exe"
         },
         "Firefox": {
@@ -139,8 +285,10 @@ class FastConfigVPS(QMainWindow):
             "filename": "brave_installer.exe"
         },
         "Opera": {
-            "10.0": "https://download.opera.com/download/get/?id=42784&location=413&nothanks=yes&sub=marine",
-            "fallback": "https://files.cloudmini.net/OperaSetup.exe",
+            "6.3": "https://download.opera.com/download/get/?id=63649&nothanks=yes&sub=marine&utm_tryagain=yes",
+            "10.0": "https://download.opera.com/download/get/?id=74098&nothanks=yes&sub=marine&utm_tryagain=yes",
+            "fallback": "https://files.cloudmini.net/Opera_10.exe",
+            "fallback_6.3": "https://files.cloudmini.net/Opera_6.3.exe",
             "filename": "opera_installer.exe"
         },
         "Centbrowser": {
@@ -186,6 +334,18 @@ class FastConfigVPS(QMainWindow):
         self.setGeometry(100, 100, 750, 600)
         self.setMinimumSize(700, 550)
         
+        # Tạo thư mục logs TRUNƠC (cần trước khi gọi bất kỳ log())
+        appdata_local = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), '..', 'Local', 'FastConfigVPS')
+        self.logs_dir = os.path.normpath(appdata_local)
+        if not os.path.exists(self.logs_dir):
+            try:
+                os.makedirs(self.logs_dir)
+            except Exception as e:
+                # Fallback đến thư mục cùng nếu AppData không khả dụng
+                self.logs_dir = "logs"
+                if not os.path.exists(self.logs_dir):
+                    os.makedirs(self.logs_dir)
+        
         # Set icon
         self.set_app_icon()
         
@@ -195,15 +355,21 @@ class FastConfigVPS(QMainWindow):
         self.total_steps = 0
         self.current_step = 0
         self.running_tasks = []
-        
-        # Tạo thư mục logs nếu chưa có
-        self.logs_dir = "logs"
-        if not os.path.exists(self.logs_dir):
-            os.makedirs(self.logs_dir)
+        self.install_queue = []  # Queue for sequential software installation
+        self.current_install_thread = None
+        self.has_errors = False  # Track nếu có lỗi trong quá trình cấu hình
+        self.downloaded_files = []  # Danh sách file đã tải trong chế độ download-only
         
         # Cấu hình giao diện
         self.init_ui()
         self.apply_theme()
+        
+        # Connect signals for thread-safe UI updates
+        self.log_signal.connect(self._append_log)
+        self.status_signal.connect(self._update_status_ui)
+        self.progress_signal.connect(self._update_progress_ui)
+        self.stop_processing_signal.connect(self._stop_processing_ui)
+        self.enable_button_signal.connect(self.start_button.setEnabled)
         
         # Log khởi động
         self.log(f"FastConfigVPS v{self.VERSION} đã khởi động")
@@ -325,6 +491,9 @@ class FastConfigVPS(QMainWindow):
         """)
         self.start_button.clicked.connect(self.start_configuration)
         
+        # Spinner icon cho button state
+        self.is_processing = False
+        
         # Add widgets to main layout
         main_layout.addWidget(self.tab_widget)
         main_layout.addWidget(self.progress_bar)
@@ -387,6 +556,10 @@ class FastConfigVPS(QMainWindow):
         self.cb_silent_install = QCheckBox("Cài đặt im lặng (không hiển thị)")
         self.cb_silent_install.setChecked(True)
         self.cb_download_only = QCheckBox("Chỉ tải về (không cài đặt)")
+        
+        # Làm cho 2 checkbox hoạt động như radio buttons (chỉ chọn 1)
+        self.cb_silent_install.stateChanged.connect(self.on_silent_install_changed)
+        self.cb_download_only.stateChanged.connect(self.on_download_only_changed)
         
         options_layout.addWidget(self.cb_silent_install)
         options_layout.addWidget(self.cb_download_only)
@@ -668,6 +841,16 @@ class FastConfigVPS(QMainWindow):
         
         self.tab_widget.addTab(tab, "Logs & RDP History")
     
+    def on_silent_install_changed(self, state):
+        """Khi tích 'Cài đặt im lặng' thì untick 'Chỉ tải về'"""
+        if state == Qt.Checked and self.cb_download_only.isChecked():
+            self.cb_download_only.setChecked(False)
+    
+    def on_download_only_changed(self, state):
+        """Khi tích 'Chỉ tải về' thì untick 'Cài đặt im lặng'"""
+        if state == Qt.Checked and self.cb_silent_install.isChecked():
+            self.cb_silent_install.setChecked(False)
+    
     def toggle_dns_input(self):
         """Toggle giữa DNS combo và custom DNS input"""
         if self.cb_custom_dns.isChecked():
@@ -697,19 +880,34 @@ class FastConfigVPS(QMainWindow):
             return "Windows (Version Unknown)"
     
     def detect_windows_version(self):
-        """Phát hiện phiên bản Windows"""
+        """Phát hiện phiên bản Windows (sử dụng ver command + registry)"""
         try:
+            # Phương pháp 1: Sử dụng lệnh ver để lấy build number chính xác
+            result = subprocess.run("ver", capture_output=True, text=True, shell=True)
+            output = result.stdout
+            
+            # Parse output từ ver command: "Microsoft Windows [Version X.X.XXXXX.XXXXX]"
+            import re as regex
+            match = regex.search(r"Version ([0-9]+\.[0-9]+)", output)
+            if match:
+                version = match.group(1)
+                self.log(f"Phát hiện Windows version từ ver command: {version}")
+                return version
+            
+            # Phương pháp 2: Fallback vào registry
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
             version, _ = winreg.QueryValueEx(key, "CurrentVersion")
             winreg.CloseKey(key)
+            self.log(f"Phát hiện Windows version từ registry: {version}")
             return version
-        except:
-            return "10.0"  # Default
+        except Exception as e:
+            self.log(f"Không thể phát hiện Windows version: {str(e)}")
+            return "10.0"  # Default to Windows 10
     
     def detect_network_config(self):
         """Phát hiện cấu hình mạng hiện tại"""
         try:
-            result = subprocess.run("ipconfig /all", capture_output=True, text=True, shell=True)
+            result = subprocess.run("ipconfig /all", capture_output=True, text=True, encoding='utf-8', errors='ignore', shell=True)
             output = result.stdout
             
             # Parse IP, subnet, gateway
@@ -796,36 +994,63 @@ class FastConfigVPS(QMainWindow):
         self.password_strength_label.setStyleSheet(f"color: {color}; font-weight: bold;")
     
     def log(self, message):
-        """Ghi log"""
+        """Ghi log - thread-safe version"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] {message}"
         
-        # Hiển thị trong UI
-        self.log_text.append(log_message)
-        
-        # Cuộn xuống cuối
-        cursor = self.log_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_text.setTextCursor(cursor)
-        
-        # Ghi ra file
+        # Check if we're in the main thread
+        if threading.current_thread() is threading.main_thread():
+            self._append_log(log_message)
+        else:
+            # Use signal for thread-safe logging from worker threads
+            self.log_signal.emit(log_message)
+    
+    def _append_log(self, log_message):
+        """Actually append log to UI - must be called from main thread"""
         try:
-            log_date = datetime.now().strftime("%Y-%m-%d")
-            log_file = os.path.join(self.logs_dir, f"fastconfig_{log_date}.log")
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(log_message + "\n")
+            # Kiểm tra log_text đã được khởi tạo chưa
+            if hasattr(self, 'log_text') and self.log_text is not None:
+                # Hiển thị trong UI
+                self.log_text.append(log_message)
+                
+                # Cuộn xuống cuối - simplified version without QTextCursor issues
+                scrollbar = self.log_text.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+            
+            # Ghi ra file (không phụ thuộc vào log_text)
+            try:
+                log_date = datetime.now().strftime("%Y-%m-%d")
+                log_file = os.path.join(self.logs_dir, f"fastconfig_{log_date}.log")
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(log_message + "\n")
+            except Exception as e:
+                print(f"Lỗi ghi log: {str(e)}")
         except Exception as e:
-            print(f"Lỗi ghi log: {str(e)}")
+            print(f"Lỗi append log: {str(e)}")
     
     def update_status(self, message):
-        """Cập nhật trạng thái"""
+        """Cập nhật trạng thái - thread-safe"""
+        if threading.current_thread() is threading.main_thread():
+            self._update_status_ui(message)
+        else:
+            self.status_signal.emit(message)
+    
+    @pyqtSlot(str)
+    def _update_status_ui(self, message):
+        """Cập nhật UI status (chạy trong main thread)"""
         self.status_label.setText(message)
-        QApplication.processEvents()
     
     def update_progress(self, value):
-        """Cập nhật progress bar"""
+        """Cập nhật progress bar - thread-safe"""
+        if threading.current_thread() is threading.main_thread():
+            self._update_progress_ui(value)
+        else:
+            self.progress_signal.emit(value)
+    
+    @pyqtSlot(int)
+    def _update_progress_ui(self, value):
+        """Cập nhật UI progress (chạy trong main thread)"""
         self.progress_bar.setValue(value)
-        QApplication.processEvents()
     
     def count_selected_tasks(self):
         """Đếm số tác vụ được chọn"""
@@ -868,6 +1093,52 @@ class FastConfigVPS(QMainWindow):
         
         return count
     
+    def start_processing_mode(self):
+        """Chuyển nút sang chế độ đang xử lý"""
+        self.is_processing = True
+        self.start_button.setText("⏳ Đang xử lý...")
+        self.start_button.setStyleSheet("""
+            QPushButton {
+                background-color: #6b7280;
+                color: white;
+                padding: 8px;
+                border-radius: 5px;
+                font-size: 13px;
+                font-weight: 600;
+                min-height: 38px;
+            }
+        """)
+    
+    def stop_processing_mode(self):
+        """Khôi phục lại nút gốc - thread-safe"""
+        if threading.current_thread() is threading.main_thread():
+            self._stop_processing_ui()
+        else:
+            self.stop_processing_signal.emit()
+    
+    @pyqtSlot()
+    def _stop_processing_ui(self):
+        """Khôi phục UI nút (chạy trong main thread)"""
+        self.is_processing = False
+        self.start_button.setText("🚀 Bắt đầu cấu hình")
+        self.start_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4f46e5;
+                color: white;
+                padding: 8px;
+                border-radius: 5px;
+                font-size: 13px;
+                font-weight: 600;
+                min-height: 38px;
+            }
+            QPushButton:hover {
+                background-color: #4338ca;
+            }
+            QPushButton:pressed {
+                background-color: #3730a3;
+            }
+        """)
+    
     def start_configuration(self):
         """Bắt đầu quá trình cấu hình"""
         self.total_steps = self.count_selected_tasks()
@@ -878,10 +1149,12 @@ class FastConfigVPS(QMainWindow):
         
         self.current_step = 0
         self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
+        self.progress_bar.setValue(5)  # Ngay lập tức lên 5% để phản ánh đã nhấn nút
         self.start_button.setEnabled(False)
+        self.start_processing_mode()  # Chuyển sang chế độ processing
         
         self.log(f"Bắt đầu cấu hình với {self.total_steps} tác vụ...")
+        self.update_status("Đang xử lý...")
         
         # Chạy cấu hình trong thread
         threading.Thread(target=self.run_configuration, daemon=True).start()
@@ -889,6 +1162,10 @@ class FastConfigVPS(QMainWindow):
     def run_configuration(self):
         """Chạy các tác vụ cấu hình"""
         try:
+            # Reset error flag và downloaded files list
+            self.has_errors = False
+            self.downloaded_files = []
+            
             # System configurations
             self.process_system_configuration()
             
@@ -901,20 +1178,51 @@ class FastConfigVPS(QMainWindow):
             # Software installations
             self.process_software_installation()
             
+            # Nếu có file đã tải trong chế độ download-only, mở thư mục
+            if self.downloaded_files and self.cb_download_only.isChecked():
+                try:
+                    # Mở thư mục Temp và highlight file đầu tiên
+                    first_file = self.downloaded_files[0]
+                    subprocess.run(f'explorer /select,"{first_file}"', shell=True)
+                    self.log(f"📂 Đã mở thư mục chứa {len(self.downloaded_files)} file")
+                except Exception as e:
+                    self.log(f"⚠️ Không thể mở thư mục: {str(e)}")
+            
             # Hoàn thành
             self.update_progress(100)
             self.update_status("Cấu hình hoàn tất!")
-            self.log("✓ Cấu hình đã hoàn thành thành công!")
             
-            QMessageBox.information(self, "Thành công", 
-                "Cấu hình đã hoàn thành!\n\nMột số thay đổi có thể cần khởi động lại hệ thống.")
+            # Thông báo kết quả tùy theo có lỗi hay không
+            if self.has_errors:
+                self.log("⚠️ Cấu hình hoàn tất nhưng có một số lỗi. Kiểm tra log để biết thêm chi tiết.")
+                QMetaObject.invokeMethod(
+                    self,
+                    '_show_warning_message',
+                    Qt.QueuedConnection
+                )
+            else:
+                self.log("✓ Cấu hình đã hoàn thành thành công!")
+                QMetaObject.invokeMethod(
+                    self,
+                    '_show_success_message',
+                    Qt.QueuedConnection
+                )
         
         except Exception as e:
             self.log(f"✗ Lỗi trong quá trình cấu hình: {str(e)}")
-            QMessageBox.critical(self, "Lỗi", f"Đã xảy ra lỗi:\n{str(e)}")
+            # Hiển thị popup lỗi trong main thread
+            error_msg = str(e)
+            QMetaObject.invokeMethod(
+                self,
+                '_show_error_message',
+                Qt.QueuedConnection,
+                Q_ARG(str, error_msg)
+            )
         
         finally:
-            self.start_button.setEnabled(True)
+            # Thread-safe enable button và khôi phục UI
+            self.enable_button_signal.emit(True)
+            self.stop_processing_mode()
     
     def increment_progress(self, task_name):
         """Tăng progress và cập nhật trạng thái"""
@@ -922,6 +1230,25 @@ class FastConfigVPS(QMainWindow):
         progress = int((self.current_step / self.total_steps) * 100)
         self.update_progress(progress)
         self.update_status(f"{task_name} ({self.current_step}/{self.total_steps})")
+    
+    @pyqtSlot()
+    def _show_success_message(self):
+        """Hiển thị popup thành công (chạy trong main thread)"""
+        QMessageBox.information(self, "Thành công", 
+            "Cấu hình đã hoàn thành!\n\nMột số thay đổi có thể cần khởi động lại hệ thống.")
+    
+    @pyqtSlot()
+    def _show_warning_message(self):
+        """Hiển thị popup cảnh báo (chạy trong main thread)"""
+        QMessageBox.warning(self, "Hoàn tất với lỗi", 
+            "Cấu hình đã hoàn tất nhưng có một số lỗi.\n\n"
+            "Kiểm tra tab 'Logs & RDP History' để xem chi tiết.\n\n"
+            "Một số thay đổi có thể cần khởi động lại hệ thống.")
+    
+    @pyqtSlot(str)
+    def _show_error_message(self, error_msg):
+        """Hiển thị popup lỗi (chạy trong main thread)"""
+        QMessageBox.critical(self, "Lỗi", f"Đã xảy ra lỗi:\n{error_msg}")
     
     def process_system_configuration(self):
         """Xử lý cấu hình hệ thống"""
@@ -1203,7 +1530,7 @@ class FastConfigVPS(QMainWindow):
                 self.install_software(software_name)
     
     def install_software(self, software_name):
-        """Cài đặt một phần mềm"""
+        """Cài đặt một phần mềm - synchronous version for worker thread"""
         try:
             self.update_status(f"Đang chuẩn bị cài đặt {software_name}...")
             
@@ -1211,54 +1538,271 @@ class FastConfigVPS(QMainWindow):
             software_info = self.SOFTWARE_URLS.get(software_name)
             if not software_info:
                 self.log(f"✗ Không tìm thấy thông tin cho {software_name}")
+                self.increment_progress(f"Cài đặt {software_name}")
                 return
             
             url = software_info.get(self.windows_version, software_info.get("10.0"))
             if not url:
-                url = software_info.get("fallback")
+                # Kiểm tra fallback theo version trước
+                fallback_key = f"fallback_{self.windows_version}"
+                url = software_info.get(fallback_key, software_info.get("fallback"))
             
             filename = software_info.get("filename")
             filepath = os.path.join(tempfile.gettempdir(), filename)
             
-            self.log(f"Đang tải {software_name} từ {url}...")
+            # Bước 1: Tải file
+            self.update_status(f"Đang tải {software_name}...")
+            self.log(f"📥 Bắt đầu tải {software_name} từ {url}...")
             
-            # Download
-            download_thread = DownloadThread(url, filepath, software_name)
-            download_thread.log_signal.connect(self.log)
-            download_thread.finished.connect(
-                lambda success, path: self.on_download_finished(success, path, software_name)
-            )
-            download_thread.start()
-            download_thread.wait()  # Wait for download to complete
+            # Download file directly (synchronous) with fallback retry
+            download_success = False
+            urls_to_try = [url]
+            
+            # Thêm fallback URLs
+            fallback_key = f"fallback_{self.windows_version}"
+            if fallback_key in software_info:
+                urls_to_try.append(software_info[fallback_key])
+            if "fallback" in software_info:
+                urls_to_try.append(software_info["fallback"])
+            
+            for attempt, try_url in enumerate(urls_to_try):
+                try:
+                    if attempt > 0:
+                        self.log(f"🔄 Thử URL dự phòng #{attempt}: {try_url}")
+                    
+                    # Create SSL context that bypasses certificate verification
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    
+                    # Tạo request với browser headers để bypass 403
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1'
+                    }
+                    
+                    req = urllib.request.Request(try_url, headers=headers)
+                    
+                    if try_url.startswith('https://'):
+                        opener = urllib.request.build_opener(
+                            urllib.request.HTTPSHandler(context=ssl_context)
+                        )
+                        urllib.request.install_opener(opener)
+                    
+                    # Tải file với headers
+                    with urllib.request.urlopen(req) as response:
+                        with open(filepath, 'wb') as out_file:
+                            out_file.write(response.read())
+                    
+                    if os.path.exists(filepath):
+                        download_success = True
+                        break
+                        
+                except Exception as download_error:
+                    self.log(f"✗ Lỗi tải từ {try_url}: {str(download_error)}")
+                    if attempt < len(urls_to_try) - 1:
+                        continue
+            
+            if not download_success or not os.path.exists(filepath):
+                self.log(f"✗ Không thể tải {software_name} từ tất cả các URL")
+                self.has_errors = True
+                # Phải tăng progress trước khi return sớm
+                self.current_step += 1.0  # +1.0 vì skip cả download và install
+                progress = int((self.current_step / self.total_steps) * 100)
+                self.update_progress(progress)
+                return
+            
+            try:
+                
+                size = os.path.getsize(filepath)
+                self.log(f"✓ Tải {software_name} hoàn tất ({size:,} bytes)")
+                
+                # Cập nhật progress sau khi tải xong (50%)
+                self.current_step += 0.5
+                progress = int((self.current_step / self.total_steps) * 100)
+                self.update_progress(progress)
+                self.update_status(f"Đang cài đặt {software_name}...")
+                
+                # Kiểm tra và đổi tên file MSI nếu cần (cho Chrome)
+                if software_name == "Chrome":
+                    filepath = self._check_and_rename_msi_file(filepath)
+                
+                # Bước 2: Cài đặt
+                if not self.cb_download_only.isChecked():
+                    self.update_status(f"Đang cài đặt {software_name}...")
+                    self.log(f"🔧 Bắt đầu cài đặt {software_name}...")
+                    
+                    # Sử dụng logic cài đặt cải tiến cho Chrome
+                    if software_name == "Chrome":
+                        success = self._install_chrome_sync(filepath)
+                        if success:
+                            self.log(f"✓ Cài đặt {software_name} thành công")
+                        else:
+                            self.log(f"✗ Cài đặt {software_name} thất bại")
+                            self.has_errors = True
+                    else:
+                        # Logic cho các phần mềm khác
+                        if software_name == "Firefox":
+                            params = "-ms" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "Edge":
+                            params = "/silent /install" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "Opera":
+                            # Opera silent install (không launch sau khi cài)
+                            params = "--silent --launchopera=0" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "Brave":
+                            # Brave dùng /silent /install nhưng cần thời gian download thêm
+                            params = "/silent /install" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "Centbrowser":
+                            # Centbrowser dùng parameters đặc biệt
+                            params = "--cb-auto-update --do-not-launch-chrome --system-level" if self.cb_silent_install.isChecked() else ""
+                        else:
+                            params = "/S" if self.cb_silent_install.isChecked() else ""
+                        
+                        # Brave cần timeout lâu hơn vì phải download installer thực
+                        timeout_seconds = 600 if software_name == "Brave" else 300
+                        
+                        cmd = f'"{filepath}" {params}'
+                        self.log(f"   Lệnh: {cmd}")
+                        if software_name == "Brave":
+                            self.log(f"   ⚠️ Brave cần thời gian tải thêm installer, vui lòng chờ...")
+                        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout_seconds)
+                        
+                        if result.returncode == 0:
+                            self.log(f"✓ Cài đặt {software_name} thành công")
+                        else:
+                            self.log(f"✗ Cài đặt {software_name} thất bại (exit code: {result.returncode})")
+                            self.has_errors = True
+                    
+                    # Dọon dẹp file tạm (retry vì process có thể đang giữ file)
+                    max_retries = 5
+                    for retry in range(max_retries):
+                        try:
+                            if os.path.exists(filepath):
+                                time.sleep(1)  # Đợi process release file
+                                os.remove(filepath)
+                                self.log(f"🗑️ Đã xóa file tạm: {os.path.basename(filepath)}")
+                                break
+                        except Exception as cleanup_err:
+                            if retry < max_retries - 1:
+                                time.sleep(2)  # Đợi lâu hơn trước khi thử lại
+                            else:
+                                self.log(f"⚠️ Không thể xóa file tạm (installer đang sử dụng): {os.path.basename(filepath)}")
+                else:
+                    self.log(f"📦 Chế độ chỉ tải - bỏ qua cài đặt {software_name}")
+                    self.log(f"   File lưu tại: {filepath}")
+                    # Thêm vào danh sách file đã tải
+                    self.downloaded_files.append(filepath)
+                    
+            except Exception as e:
+                self.log(f"✗ Lỗi khi cài {software_name}: {str(e)}")
+                self.has_errors = True
             
         except Exception as e:
             self.log(f"✗ Lỗi khi cài đặt {software_name}: {str(e)}")
-            self.increment_progress(f"Cài đặt {software_name}")
-    
-    def on_download_finished(self, success, filepath, software_name):
-        """Xử lý sau khi download xong"""
-        if not success:
-            self.increment_progress(f"Cài đặt {software_name}")
-            return
+            self.has_errors = True
         
-        if self.cb_download_only.isChecked():
-            self.log(f"✓ Chỉ tải về - bỏ qua cài đặt {software_name}")
-            self.increment_progress(f"Tải {software_name}")
-            return
-        
-        # Install
-        install_thread = InstallThread(filepath, software_name, self.cb_silent_install.isChecked())
-        install_thread.log_signal.connect(self.log)
-        install_thread.finished.connect(lambda success, name: self.increment_progress(f"Cài đặt {name}"))
-        install_thread.start()
-        install_thread.wait()  # Wait for installation to complete
-        
-        # Cleanup
+        finally:
+            # Luôn increment progress để hoàn tất task
+            self.current_step += 0.5
+            progress = int((self.current_step / self.total_steps) * 100)
+            self.update_progress(progress)
+    def _check_and_rename_msi_file(self, filepath):
+        """Kiểm tra file header và đổi tên nếu là MSI (cho main thread)"""
         try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except:
-            pass
+            with open(filepath, 'rb') as f:
+                header = f.read(8)
+            
+            # MSI file signature: D0 CF 11 E0 A1 B1 1A E1
+            if header[:8] == b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1':
+                self.log("🔍 Phát hiện file MSI (header: D0CF11E0)")
+                
+                if filepath.endswith('.exe'):
+                    new_filepath = filepath[:-4] + '.msi'
+                    
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            if os.path.exists(new_filepath):
+                                os.remove(new_filepath)
+                            os.rename(filepath, new_filepath)
+                            self.log(f"✓ Đã đổi tên file thành {os.path.basename(new_filepath)}")
+                            return new_filepath
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                time.sleep(0.5)
+                            else:
+                                self.log(f"⚠️ Không thể đổi tên file: {str(e)}")
+                                return filepath
+            
+            return filepath
+        
+        except Exception as e:
+            self.log(f"⚠️ Lỗi khi kiểm tra file header: {str(e)}")
+            return filepath
+    
+    def _install_chrome_sync(self, filepath):
+        """Cài đặt Chrome với logic cải tiến (cho main thread)"""
+        is_msi = filepath.lower().endswith('.msi')
+        
+        if is_msi:
+            methods = [
+                ('msiexec /qn', f'msiexec /i "{filepath}" /qn /norestart'),
+                ('msiexec /passive', f'msiexec /i "{filepath}" /passive /norestart')
+            ]
+        else:
+            methods = [
+                ('AutoIt (/silent /install)', f'"{filepath}" /silent /install'),
+                ('Interactive (no params)', f'"{filepath}"')
+            ]
+        
+        for method_name, cmd in methods:
+            try:
+                self.log(f"🔧 Thử phương pháp: {method_name}")
+                self.log(f"   Lệnh: {cmd}")
+                
+                result = subprocess.run(
+                    cmd, 
+                    shell=True, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=300
+                )
+                
+                self.log(f"   Exit code: {result.returncode}")
+                
+                # Kiểm tra Chrome có thực sự được cài
+                chrome_paths = [
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+                ]
+                
+                chrome_found = any(os.path.exists(path) for path in chrome_paths)
+                
+                if result.returncode == 0:
+                    if chrome_found:
+                        self.log(f"✓ {method_name} thành công - Chrome đã được cài đặt")
+                        return True
+                    else:
+                        self.log(f"⚠️ Exit code 0 nhưng Chrome không được cài - thử phương pháp tiếp theo")
+                else:
+                    self.log(f"✗ Phương pháp {method_name} thất bại (exit code: {result.returncode})")
+                    if result.stderr:
+                        error_msg = result.stderr.strip()
+                        if error_msg:
+                            self.log(f"   Error: {error_msg[:200]}")
+                
+            except subprocess.TimeoutExpired:
+                self.log(f"⚠️ Timeout - Phương pháp {method_name} chạy quá lâu")
+                continue
+            except Exception as e:
+                self.log(f"✗ Lỗi với phương pháp {method_name}: {str(e)}")
+                continue
+        
+        self.log("✗ Tất cả các phương pháp cài đặt Chrome đều thất bại")
+        return False
     
     def set_registry_value(self, hkey, path, name, value, value_type):
         """Thiết lập giá trị registry"""
@@ -1468,6 +2012,7 @@ class FastConfigVPS(QMainWindow):
                     capture_output=True,
                     text=True,
                     encoding='utf-8',
+                    errors='ignore',
                     timeout=15,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                 )
@@ -1499,6 +2044,7 @@ class FastConfigVPS(QMainWindow):
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
+                errors='ignore',
                 timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
@@ -1523,6 +2069,7 @@ class FastConfigVPS(QMainWindow):
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
+                errors='ignore',
                 timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
@@ -1731,6 +2278,7 @@ class FastConfigVPS(QMainWindow):
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
+                errors='ignore',
                 timeout=30
             )
             
@@ -1750,13 +2298,13 @@ class FastConfigVPS(QMainWindow):
         """Lấy RDP events bằng PowerShell"""
         try:
             # Chỉ lấy RDP events (Logon Type 10)
-            ps_script = '''
+            ps_script = r'''
             $startTime = (Get-Date).AddDays(-30)
             Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4624; StartTime=$startTime} -MaxEvents 100 | 
             Where-Object { 
                 $_.Message -match 'Logon Type:\s+10' -and 
                 $_.Message -notmatch 'Account Name:\s+(SYSTEM|ANONYMOUS LOGON|DWM-)' 
-            } | 
+            } |
             ForEach-Object {
                 $message = $_.Message
                 $account = if ($message -match 'Account Name:\s+([^\r\n]+)') { $matches[1].Trim() } else { 'Unknown' }
@@ -1773,6 +2321,7 @@ class FastConfigVPS(QMainWindow):
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
+                errors='ignore',
                 timeout=30
             )
             
@@ -1864,7 +2413,7 @@ class FastConfigVPS(QMainWindow):
             self.log("  → Chuẩn bị PowerShell command...")
             
             # PowerShell script tối ưu - inline, không cần file tạm
-            ps_command = """
+            ps_command = r"""
 $ErrorActionPreference='SilentlyContinue';
 $d=(Get-Date).AddDays(-30);
 $e=Get-WinEvent -FilterHashtable @{LogName='Security';Id=4624;StartTime=$d} -MaxEvents 500 | Where-Object {
@@ -1900,6 +2449,7 @@ if($e){$e|ConvertTo-Json -Compress}else{'NO_EVENTS'}
                 text=True,
                 timeout=45,  # Tăng timeout lên 45s cho an toàn
                 encoding='utf-8',
+                errors='ignore',
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
             
