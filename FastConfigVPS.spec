@@ -3,8 +3,8 @@
 block_cipher = None
 
 a = Analysis(
-    ['fast_config_vps_qt5.py'],
-    pathex=[],
+    ['FastConfigVPS.py'],
+    pathex=['.'],
     binaries=[],
     datas=[('app_icon.png', '.')],
     hiddenimports=['win32timezone'],
@@ -27,7 +27,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='FastConfigVPS_PyQt5_v3.1',
+    name='FastConfigVPS_v3.1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -41,4 +41,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='app_icon.ico',
+    uac_admin=True,
 )

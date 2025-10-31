@@ -88,4 +88,5 @@ echo ========================================
 echo   Build process completed!
 echo ========================================
 popd
+pause
 exit /b 0

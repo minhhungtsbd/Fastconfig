@@ -307,22 +307,22 @@ class FastConfigVPS(QMainWindow):
             "filename": "ProxifierSetup.exe"
         },
         "WinRAR": {
-            "10.0": "https://www.rarlab.com/rar/winrar-x64-621.exe",
+            "10.0": "https://www.rarlab.com/rar/winrar-x64-713.exe",
             "fallback": "https://files.cloudmini.net/winrar-x64.exe",
             "filename": "winrar.exe"
         },
         "7-Zip": {
-            "10.0": "https://www.7-zip.org/a/7z2201-x64.exe",
+            "10.0": "https://www.7-zip.org/a/7z2501-x64.exe",
             "fallback": "https://files.cloudmini.net/7z-x64.exe",
             "filename": "7zip.exe"
         },
         "Notepad++": {
-            "10.0": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.5.4/npp.8.5.4.Installer.x64.exe",
+            "10.0": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.8.6/npp.8.8.6.Installer.x64.exe",
             "fallback": "https://files.cloudmini.net/npp.Installer.x64.exe",
             "filename": "notepadpp.exe"
         },
         "VLC": {
-            "10.0": "https://get.videolan.org/vlc/3.0.18/win64/vlc-3.0.18-win64.exe",
+            "10.0": "https://files.cloudmini.net/vlc-win64.exe",
             "fallback": "https://files.cloudmini.net/vlc-win64.exe",
             "filename": "vlc.exe"
         }
@@ -377,6 +377,9 @@ class FastConfigVPS(QMainWindow):
         
         # Detect network configuration
         self.detect_network_config()
+
+        # Log update system availability
+        self.log("Hệ thống cập nhật từ GitHub Releases sẵn sàng. Dùng nút ⟳ để kiểm tra.")
     
     def set_app_icon(self):
         """Thiết lập icon cho ứng dụng"""
@@ -440,9 +443,17 @@ class FastConfigVPS(QMainWindow):
             }
         """)
         self.theme_button.clicked.connect(self.toggle_theme)
+
+        # Update button (GitHub Releases)
+        self.update_button = QPushButton("⟳")
+        self.update_button.setToolTip("Kiểm tra cập nhật")
+        self.update_button.setFixedSize(36, 36)
+        self.update_button.setStyleSheet(self.theme_button.styleSheet())
+        self.update_button.clicked.connect(self.on_check_update_click)
         
         top_bar.addWidget(title_label)
         top_bar.addStretch()
+        top_bar.addWidget(self.update_button)
         top_bar.addWidget(self.theme_button)
         
         main_layout.addLayout(top_bar)
@@ -1658,38 +1669,63 @@ class FastConfigVPS(QMainWindow):
                         elif software_name == "Centbrowser":
                             # Centbrowser dùng parameters đặc biệt
                             params = "--cb-auto-update --do-not-launch-chrome --system-level" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "Bitvise SSH":
+                            # Bitvise SSH (Inno Setup)
+                            params = "-acceptEULA" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "Proxifier":
+                            # Proxifier (Inno Setup)
+                            params = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" if self.cb_silent_install.isChecked() else ""
+                        elif software_name == "VLC":
+                            # VLC (NSIS)
+                            params = "/S" if self.cb_silent_install.isChecked() else ""
                         else:
+                            # Default cho NSIS installers (WinRAR, 7-Zip, Notepad++)
                             params = "/S" if self.cb_silent_install.isChecked() else ""
                         
                         # Brave cần timeout lâu hơn vì phải download installer thực
                         timeout_seconds = 600 if software_name == "Brave" else 300
-                        
-                        cmd = f'"{filepath}" {params}'
-                        self.log(f"   Lệnh: {cmd}")
-                        if software_name == "Brave":
-                            self.log(f"   ⚠️ Brave cần thời gian tải thêm installer, vui lòng chờ...")
-                        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout_seconds)
-                        
-                        if result.returncode == 0:
-                            self.log(f"✓ Cài đặt {software_name} thành công")
+
+                        interactive_vlc = (software_name == "VLC")
+                        if interactive_vlc:
+                            cmd = f'"{filepath}"'
+                            self.log(f"   Lệnh: {cmd} (GUI)")
+                            try:
+                                subprocess.Popen(cmd, shell=True)
+                                self.log("   ✓ Đã mở trình cài đặt VLC (GUI). Không chờ hoàn tất.")
+                            except Exception as e:
+                                self.log(f"✗ Không thể khởi chạy trình cài đặt VLC: {str(e)}")
+                                self.has_errors = True
                         else:
-                            self.log(f"✗ Cài đặt {software_name} thất bại (exit code: {result.returncode})")
-                            self.has_errors = True
-                    
-                    # Dọon dẹp file tạm (retry vì process có thể đang giữ file)
-                    max_retries = 5
-                    for retry in range(max_retries):
-                        try:
-                            if os.path.exists(filepath):
-                                time.sleep(1)  # Đợi process release file
-                                os.remove(filepath)
-                                self.log(f"🗑️ Đã xóa file tạm: {os.path.basename(filepath)}")
-                                break
-                        except Exception as cleanup_err:
-                            if retry < max_retries - 1:
-                                time.sleep(2)  # Đợi lâu hơn trước khi thử lại
+                            cmd = f'"{filepath}" {params}'
+                            self.log(f"   Lệnh: {cmd}")
+                            if software_name == "Brave":
+                                self.log(f"   ⚠️ Brave cần thời gian tải thêm installer, vui lòng chờ...")
+                            result = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout_seconds)
+
+                            if result.returncode == 0:
+                                self.log(f"✓ Cài đặt {software_name} thành công")
                             else:
-                                self.log(f"⚠️ Không thể xóa file tạm (installer đang sử dụng): {os.path.basename(filepath)}")
+                                self.log(f"✗ Cài đặt {software_name} thất bại (exit code: {result.returncode})")
+                                self.has_errors = True
+                    
+                    # Dọn dẹp file tạm (bỏ qua nếu VLC chạy dạng GUI để tránh ảnh hưởng)
+                    interactive_vlc = (software_name == "VLC")
+                    if not interactive_vlc:
+                        max_retries = 5
+                        for retry in range(max_retries):
+                            try:
+                                if os.path.exists(filepath):
+                                    time.sleep(1)  # Đợi process release file
+                                    os.remove(filepath)
+                                    self.log(f"🗑️ Đã xóa file tạm: {os.path.basename(filepath)}")
+                                    break
+                            except Exception as cleanup_err:
+                                if retry < max_retries - 1:
+                                    time.sleep(2)  # Đợi lâu hơn trước khi thử lại
+                                else:
+                                    self.log(f"⚠️ Không thể xóa file tạm (installer đang sử dụng): {os.path.basename(filepath)}")
+                    else:
+                        self.log("ℹ️ Bỏ qua xóa file tạm của VLC để không ảnh hưởng quá trình cài đặt GUI")
                 else:
                     self.log(f"📦 Chế độ chỉ tải - bỏ qua cài đặt {software_name}")
                     self.log(f"   File lưu tại: {filepath}")
@@ -1804,6 +1840,118 @@ class FastConfigVPS(QMainWindow):
         self.log("✗ Tất cả các phương pháp cài đặt Chrome đều thất bại")
         return False
     
+    def on_check_update_click(self):
+        """Kiểm tra cập nhật từ GitHub Releases (chạy nền)"""
+        threading.Thread(target=self.check_github_update, daemon=True).start()
+
+    def check_github_update(self):
+        """Kiểm tra và tải cập nhật từ GitHub Releases"""
+        try:
+            # Cấu hình GitHub
+            GITHUB_REPO = "minhhungtsbd/Fastconfig"
+            GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            
+            self.update_button.setEnabled(False)
+            self.update_status("Đang kiểm tra cập nhật từ GitHub...")
+            self.log(f"🔍 Kiểm tra phiên bản mới từ {GITHUB_REPO}...")
+            
+            # Gọi GitHub API để lấy thông tin release mới nhất
+            import urllib.request
+            import json
+            
+            req = urllib.request.Request(GITHUB_API)
+            req.add_header('User-Agent', 'FastConfigVPS-Updater')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+            
+            latest_version = data.get('tag_name', '').lstrip('v')
+            release_url = data.get('html_url', '')
+            assets = data.get('assets', [])
+            
+            self.log(f"ℹ️ Phiên bản hiện tại: {self.VERSION}")
+            self.log(f"ℹ️ Phiên bản mới nhất: {latest_version}")
+            
+            # So sánh phiên bản
+            if latest_version == self.VERSION:
+                self.log("✓ Bạn đang dùng phiên bản mới nhất.")
+                QMessageBox.information(self, "Cập nhật", 
+                    f"Bạn đang dùng phiên bản mới nhất ({self.VERSION}).")
+                return
+            
+            # Tìm file EXE trong assets
+            exe_asset = None
+            for asset in assets:
+                if asset['name'].endswith('.exe'):
+                    exe_asset = asset
+                    break
+            
+            if not exe_asset:
+                self.log("✗ Không tìm thấy file EXE trong bản phát hành mới.")
+                QMessageBox.warning(self, "Cập nhật", "Không tìm thấy file cài đặt.")
+                return
+            
+            # Hiển thị thông báo có bản mới
+            reply = QMessageBox.question(
+                self, 
+                "Cập nhật mới",
+                f"Có phiên bản mới: {latest_version}\n\n"
+                f"Kích thước: {exe_asset['size'] / 1024 / 1024:.1f} MB\n\n"
+                f"Bạn có muốn tải và cài đặt không?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                self.log("ℹ️ Người dùng hủy cập nhật.")
+                return
+            
+            # Tải file EXE mới
+            download_url = exe_asset['browser_download_url']
+            temp_exe = os.path.join(tempfile.gettempdir(), exe_asset['name'])
+            
+            self.log(f"📥 Đang tải {exe_asset['name']}...")
+            self.update_status(f"Đang tải cập nhật ({exe_asset['size'] / 1024 / 1024:.1f} MB)...")
+            
+            urllib.request.urlretrieve(download_url, temp_exe)
+            
+            if not os.path.exists(temp_exe):
+                self.log("✗ Tải file thất bại.")
+                QMessageBox.critical(self, "Lỗi", "Không thể tải file cập nhật.")
+                return
+            
+            self.log(f"✓ Tải thành công: {temp_exe}")
+            
+            # Tạo updater script
+            current_exe = sys.executable if getattr(sys, 'frozen', False) else __file__
+            updater_script = os.path.join(tempfile.gettempdir(), "fastconfig_updater.bat")
+            
+            with open(updater_script, 'w') as f:
+                f.write('@echo off\n')
+                f.write('echo Đang cập nhật FastConfigVPS...\n')
+                f.write('timeout /t 2 /nobreak >nul\n')
+                f.write(f'move /Y "{temp_exe}" "{current_exe}" >nul\n')
+                f.write(f'start "" "{current_exe}"\n')
+                f.write(f'del "{updater_script}"\n')
+                f.write('exit\n')
+            
+            self.log("🔄 Khởi động lại để cài đặt cập nhật...")
+            
+            # Chạy updater và thoát
+            subprocess.Popen([updater_script], shell=True)
+            QApplication.quit()
+            
+        except urllib.error.URLError as e:
+            self.log(f"✗ Lỗi kết nối: {e}")
+            QMessageBox.warning(self, "Lỗi", "Không thể kết nối đến GitHub. Kiểm tra kết nối mạng.")
+        except Exception as e:
+            self.log(f"✗ Lỗi cập nhật: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            QMessageBox.critical(self, "Lỗi", f"Lỗi cập nhật: {e}")
+        finally:
+            self.update_button.setEnabled(True)
+            self.update_status("Sẵn sàng...")
+
     def set_registry_value(self, hkey, path, name, value, value_type):
         """Thiết lập giá trị registry"""
         try:
