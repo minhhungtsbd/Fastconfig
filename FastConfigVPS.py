@@ -257,6 +257,8 @@ class FastConfigVPS(QMainWindow):
     progress_signal = pyqtSignal(int)
     stop_processing_signal = pyqtSignal()
     enable_button_signal = pyqtSignal(bool)
+    show_update_dialog_signal = pyqtSignal(str, str, float)  # version, size_mb, download_url
+    show_message_signal = pyqtSignal(str, str, str)  # title, message, type (info/warning/error)
     
     # URLs cho các phần mềm
     SOFTWARE_URLS = {
@@ -370,6 +372,8 @@ class FastConfigVPS(QMainWindow):
         self.progress_signal.connect(self._update_progress_ui)
         self.stop_processing_signal.connect(self._stop_processing_ui)
         self.enable_button_signal.connect(self.start_button.setEnabled)
+        self.show_update_dialog_signal.connect(self._show_update_dialog)
+        self.show_message_signal.connect(self._show_message_box)
         
         # Log khởi động
         self.log(f"FastConfigVPS v{self.VERSION} đã khởi động")
@@ -1875,8 +1879,11 @@ class FastConfigVPS(QMainWindow):
             # So sánh phiên bản
             if latest_version == self.VERSION:
                 self.log("✓ Bạn đang dùng phiên bản mới nhất.")
-                QMessageBox.information(self, "Cập nhật", 
-                    f"Bạn đang dùng phiên bản mới nhất ({self.VERSION}).")
+                self.show_message_signal.emit(
+                    "Cập nhật",
+                    f"Bạn đang dùng phiên bản mới nhất ({self.VERSION}).",
+                    "info"
+                )
                 return
             
             # Tìm file EXE trong assets
@@ -1888,35 +1895,96 @@ class FastConfigVPS(QMainWindow):
             
             if not exe_asset:
                 self.log("✗ Không tìm thấy file EXE trong bản phát hành mới.")
-                QMessageBox.warning(self, "Cập nhật", "Không tìm thấy file cài đặt.")
+                self.show_message_signal.emit(
+                    "Cập nhật",
+                    "Không tìm thấy file cài đặt.",
+                    "warning"
+                )
                 return
             
-            # Hiển thị thông báo có bản mới
-            reply = QMessageBox.question(
-                self, 
-                "Cập nhật mới",
-                f"Có phiên bản mới: {latest_version}\n\n"
-                f"Kích thước: {exe_asset['size'] / 1024 / 1024:.1f} MB\n\n"
-                f"Bạn có muốn tải và cài đặt không?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            
-            if reply != QMessageBox.Yes:
-                self.log("ℹ️ Người dùng hủy cập nhật.")
-                return
-            
-            # Tải file EXE mới
+            # Yêu cầu xác nhận từ main thread và đợi kết quả
             download_url = exe_asset['browser_download_url']
-            temp_exe = os.path.join(tempfile.gettempdir(), exe_asset['name'])
+            size_mb = exe_asset['size'] / 1024 / 1024
             
-            self.log(f"📥 Đang tải {exe_asset['name']}...")
-            self.update_status(f"Đang tải cập nhật ({exe_asset['size'] / 1024 / 1024:.1f} MB)...")
+            # Lưu thông tin để dialog handler xử lý
+            self.pending_update_url = download_url
+            self.pending_update_filename = exe_asset['name']
+            
+            # Hiển thị dialog từ main thread
+            self.show_update_dialog_signal.emit(latest_version, str(size_mb), download_url)
+            return  # Function sẽ được tiếp tục từ _download_and_install_update
+            
+        except urllib.error.URLError as e:
+            self.log(f"✗ Lỗi kết nối: {e}")
+            self.show_message_signal.emit(
+                "Lỗi",
+                "Không thể kết nối đến GitHub. Kiểm tra kết nối mạng.",
+                "warning"
+            )
+            self.update_button.setEnabled(True)
+        except Exception as e:
+            self.log(f"✗ Lỗi cập nhật: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            self.show_message_signal.emit(
+                "Lỗi",
+                f"Lỗi cập nhật: {e}",
+                "error"
+            )
+            self.update_button.setEnabled(True)
+        finally:
+            self.update_status("Sẵn sàng...")
+
+    @pyqtSlot(str, str, str)
+    def _show_message_box(self, title, message, msg_type):
+        """Hiển thị message box trong main thread"""
+        if msg_type == "info":
+            QMessageBox.information(self, title, message)
+        elif msg_type == "warning":
+            QMessageBox.warning(self, title, message)
+        elif msg_type == "error":
+            QMessageBox.critical(self, title, message)
+    
+    @pyqtSlot(str, str, float)
+    def _show_update_dialog(self, version, size_mb, download_url):
+        """Hiển thị dialog xác nhận cập nhật trong main thread"""
+        reply = QMessageBox.question(
+            self,
+            "Cập nhật mới",
+            f"Có phiên bản mới: {version}\n\n"
+            f"Kích thước: {size_mb} MB\n\n"
+            f"Bạn có muốn tải và cài đặt không?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            # Chạy download trong thread mới
+            threading.Thread(
+                target=self._download_and_install_update,
+                args=(download_url, self.pending_update_filename),
+                daemon=True
+            ).start()
+        else:
+            self.log("ℹ️ Người dùng hủy cập nhật.")
+            self.update_button.setEnabled(True)
+    
+    def _download_and_install_update(self, download_url, filename):
+        """Tải và cài đặt bản cập nhật"""
+        try:
+            temp_exe = os.path.join(tempfile.gettempdir(), filename)
+            
+            self.log(f"📥 Đang tải {filename}...")
+            self.update_status(f"Đang tải cập nhật...")
             
             urllib.request.urlretrieve(download_url, temp_exe)
             
             if not os.path.exists(temp_exe):
                 self.log("✗ Tải file thất bại.")
-                QMessageBox.critical(self, "Lỗi", "Không thể tải file cập nhật.")
+                self.show_message_signal.emit(
+                    "Lỗi",
+                    "Không thể tải file cập nhật.",
+                    "error"
+                )
                 return
             
             self.log(f"✓ Tải thành công: {temp_exe}")
@@ -1940,17 +2008,15 @@ class FastConfigVPS(QMainWindow):
             subprocess.Popen([updater_script], shell=True)
             QApplication.quit()
             
-        except urllib.error.URLError as e:
-            self.log(f"✗ Lỗi kết nối: {e}")
-            QMessageBox.warning(self, "Lỗi", "Không thể kết nối đến GitHub. Kiểm tra kết nối mạng.")
         except Exception as e:
-            self.log(f"✗ Lỗi cập nhật: {e}")
-            import traceback
-            self.log(traceback.format_exc())
-            QMessageBox.critical(self, "Lỗi", f"Lỗi cập nhật: {e}")
+            self.log(f"✗ Lỗi tải cập nhật: {e}")
+            self.show_message_signal.emit(
+                "Lỗi",
+                f"Lỗi tải cập nhật: {e}",
+                "error"
+            )
         finally:
             self.update_button.setEnabled(True)
-            self.update_status("Sẵn sàng...")
 
     def set_registry_value(self, hkey, path, name, value, value_type):
         """Thiết lập giá trị registry"""

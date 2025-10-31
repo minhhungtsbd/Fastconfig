@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+dist/
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Legacy files
+Browser.bat
+FastConfigVPS_v2.6.au3
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+
+# Windows
+Thumbs.db
+desktop.ini
