@@ -1668,8 +1668,8 @@ class FastConfigVPS(QMainWindow):
                             # Opera silent install (không launch sau khi cài)
                             params = "--silent --launchopera=0" if self.cb_silent_install.isChecked() else ""
                         elif software_name == "Brave":
-                            # Brave dùng /silent /install nhưng cần thời gian download thêm
-                            params = "/silent /install" if self.cb_silent_install.isChecked() else ""
+                            # Brave - test không tham số (giống click đúp)
+                            params = ""
                         elif software_name == "Centbrowser":
                             # Centbrowser dùng parameters đặc biệt
                             params = "--cb-auto-update --do-not-launch-chrome --system-level" if self.cb_silent_install.isChecked() else ""
@@ -1686,50 +1686,41 @@ class FastConfigVPS(QMainWindow):
                             # Default cho NSIS installers (WinRAR, 7-Zip, Notepad++)
                             params = "/S" if self.cb_silent_install.isChecked() else ""
                         
-                        # Brave cần timeout lâu hơn vì phải download installer thực
-                        timeout_seconds = 600 if software_name == "Brave" else 300
+                        # Browser cần timeout lâu hơn
+                        is_browser = software_name in ["Chrome", "Firefox", "Edge", "Opera", "Brave", "Centbrowser"]
+                        timeout_seconds = 600 if software_name == "Brave" else (450 if is_browser else 300)
 
-                        interactive_vlc = (software_name == "VLC")
-                        if interactive_vlc:
+                        # VLC và Brave chạy không chờ (Popen - giống click đúp)
+                        if software_name == "VLC" or software_name == "Brave":
                             cmd = f'"{filepath}"'
-                            self.log(f"   Lệnh: {cmd} (GUI)")
+                            self.log(f"   Lệnh: {cmd} (không chờ)")
                             try:
                                 subprocess.Popen(cmd, shell=True)
-                                self.log("   ✓ Đã mở trình cài đặt VLC (GUI). Không chờ hoàn tất.")
+                                time.sleep(3)  # Chờ installer khởi động
+                                self.log(f"   ✓ Đã khởi chạy {software_name} installer.")
                             except Exception as e:
-                                self.log(f"✗ Không thể khởi chạy trình cài đặt VLC: {str(e)}")
+                                self.log(f"✗ Không thể khởi chạy {software_name}: {str(e)}")
                                 self.has_errors = True
                         else:
                             cmd = f'"{filepath}" {params}'
                             self.log(f"   Lệnh: {cmd}")
-                            if software_name == "Brave":
-                                self.log(f"   ⚠️ Brave cần thời gian tải thêm installer, vui lòng chờ...")
                             result = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout_seconds)
 
                             if result.returncode == 0:
                                 self.log(f"✓ Cài đặt {software_name} thành công")
+                                
+                                # Chờ thêm cho browser hoàn tất (một số installer spawn process con)
+                                if is_browser:
+                                    self.log(f"   ⏳ Chờ {software_name} hoàn tất cài đặt...")
+                                    time.sleep(3)  # Chờ 3s cho process con hoàn tất
                             else:
                                 self.log(f"✗ Cài đặt {software_name} thất bại (exit code: {result.returncode})")
                                 self.has_errors = True
                     
-                    # Dọn dẹp file tạm (bỏ qua nếu VLC chạy dạng GUI để tránh ảnh hưởng)
-                    interactive_vlc = (software_name == "VLC")
-                    if not interactive_vlc:
-                        max_retries = 5
-                        for retry in range(max_retries):
-                            try:
-                                if os.path.exists(filepath):
-                                    time.sleep(1)  # Đợi process release file
-                                    os.remove(filepath)
-                                    self.log(f"🗑️ Đã xóa file tạm: {os.path.basename(filepath)}")
-                                    break
-                            except Exception as cleanup_err:
-                                if retry < max_retries - 1:
-                                    time.sleep(2)  # Đợi lâu hơn trước khi thử lại
-                                else:
-                                    self.log(f"⚠️ Không thể xóa file tạm (installer đang sử dụng): {os.path.basename(filepath)}")
-                    else:
-                        self.log("ℹ️ Bỏ qua xóa file tạm của VLC để không ảnh hưởng quá trình cài đặt GUI")
+                    # Không xóa file tạm ngay - để installer hoàn tất
+                    # File nằm trong %TEMP% sẽ tự động dọn dẹp bởi Windows
+                    self.log(f"ℹ️ File cài đặt để tại: {filepath}")
+                    self.log("ℹ️ Windows sẽ tự động dọn dẹp thư mục Temp.")
                 else:
                     self.log(f"📦 Chế độ chỉ tải - bỏ qua cài đặt {software_name}")
                     self.log(f"   File lưu tại: {filepath}")
